@@ -256,32 +256,150 @@
 
 ### 6.1 Image Generation 分支（`image_gen=True`）
 
-路径：
+> 代码主入口：`modeling_bailingmm2.py`
 
-1. `get_condition_embeds_for_image_gen(...)`  
-   从 LLM hidden states 组织图像条件向量
-2. `connector + proj_out`  
-   将条件映射到 diffusion 所需维度
-3. `diffusion_loss.sample(...)`  
-   采样生成图像
+#### 6.1.1 初始化与构建（在 `from_pretrained` 阶段）
 
-支持项：
+触发条件：`BailingMM2NativeForConditionalGeneration.from_pretrained(..., load_image_gen=True)`
 
-- 负向条件（negative embeds）
-- CFG / seed / steps
-- 参考图条件（`image_gen_pixel_values_reference`）
+调用链：
+
+1. `from_pretrained`  
+2. `load_image_gen_modules(inference_model_path, torch_dtype, load_image_gen_diffusion, load_image_gen_others, device)`
+
+`load_image_gen_modules` 的构建内容分两部分：
+
+1) `load_image_gen_others=True`（条件编码器部分）
+
+- `query_tokens_dict`：按 `img_gen_scales`（默认例如 `[4, 8, 16]`）初始化并加载多尺度可学习 token
+- `connector`：`AutoModelForCausalLM.from_pretrained(..., subfolder="connector")`，并设置 `self_attn.is_causal=False`
+- `proj_in`：LLM hidden size -> connector hidden size
+- `proj_out`：connector hidden size -> diffusion 条件维度（`diffusion_c_input_dim`）
+- 可选 `ByT5`：
+  - `load_byt5(...)` 加载 `byt5_model + byt5_mapper + tokenizer`
+  - 用于将文本提示附加到 condition embeds
+
+2) `load_image_gen_diffusion=True`（扩散采样器部分）
+
+根据 `mlp/config.json` 中 `dit_type` 构建不同后端：
+
+- `dit_type` 包含 `"sd3"` -> `SD3Loss`
+- `dit_type` 包含 `"sana"` -> `SANALoss`
+- `dit_type` 包含 `"zimage"` -> `ZImageLoss`
+
+最后设置 `self.loaded_image_gen_modules = True`。
+
+#### 6.1.2 执行路径（`generate(image_gen=True)`）
+
+执行主链：
+
+1. 准备条件向量：
+   - 若直接给 `image_gen_condition_embeds`：直接使用
+   - 否则调用 `get_condition_embeds_for_image_gen(...)`
+2. `get_condition_embeds_for_image_gen(...)` 内部：
+   - `append_input_ids_with_multiscale_learnable_tokens`：在文本序列中插入多尺度生成 token 段
+   - `appand_learnable_tokens`：把 learnable query token 与真实图像 token 对齐
+   - `self.model.forward(..., output_hidden_states=True)`：取末层 hidden states
+   - `gen_mask` 选出生成 token 对应 hidden
+   - `proj_in -> connector -> proj_out -> normalize` 得到 diffusion condition embeds
+3. 负向条件（negative）构建：
+   - 优先级 1：`image_gen_negative_condition_embeds`
+   - 优先级 2：`image_gen_negative_input_ids / image_gen_negative_llm_hidden_states` 走同样编码链
+   - 缺省：`condition_embeds * 0.0`
+4. 调用扩散采样：
+   - `self.diffusion_loss.sample(...)`
+   - 关键参数：`steps / seed / cfg / image_cfg / cfg_mode / height / width / ref_x`
+5. 输出后处理：
+   - 按 `process_ratio` 记录的原尺寸映射 resize
+   - `image_gen_return_batch=False` 且 batch=1 时返回单张 PIL
+
+#### 6.1.3 可配置能力与行为差异
+
+| 维度 | 参数/模块 | 行为差异 |
+|---|---|---|
+| 条件来源 | `image_gen_condition_embeds` vs 文本编码 | 前者跳过 LLM 条件提取，后者实时从 `input_ids` 推导 |
+| 负向条件 | `image_gen_negative_*` | 可做 classifier-free guidance 的负提示控制 |
+| 扩散后端 | `dit_type: sd3/sana/zimage` | 三种 `*Loss` 实现，采样器与内部结构不同 |
+| 文本增强 | `ByT5` 是否存在 | 存在时将 ByT5 映射特征拼接到 condition 序列 |
+| 参考图 | `image_gen_pixel_values_reference` | 作为 `ref_x` 注入采样器，支持参考图约束 |
+| 分辨率策略 | `image_gen_highres / height / width / aspect` | 自动对齐到可采样网格，并在输出阶段 resize 回目标比例 |
+
+---
 
 ### 6.2 Talker 分支（语音生成）
 
-`BailingTalker2` 内部结构：
+> 主代码：`modeling_bailing_talker.py`，示例入口：`test_talker.py`
 
-- 文本 backbone：`Qwen2Model`
-- 时序生成：`CFM + DiT`
-- 聚合器：`Aggregator`
-- 声纹提取：`SpkembExtractor`（ONNX）
-- token->wav：detokenizer/vae 流式解码
+#### 6.2.1 初始化与构建
 
-该分支在主 VLM 文本问答路径外独立运行，可通过 `load_talker=True` 挂载到主模型对象。
+在主模型侧通过：
+
+- `BailingMM2NativeForConditionalGeneration.from_pretrained(..., load_talker=True)`  
+  挂载：
+  - `model.talker = BailingTalker2.from_pretrained(<path>/talker)`
+  - `model.talker_vae = AudioVAE.from_pretrained(<path>/talker/vae)`
+
+`BailingTalker2.__init__` 关键构建：
+
+1. 文本 backbone：
+   - `Qwen2Config.from_pretrained(<name_or_path>/llm)`
+   - `Qwen2Model(self.model_config)`
+2. 语音 token 生成器：
+   - `CFM(DiT(...), steps=config.steps)`
+3. 映射与控制头：
+   - `Aggregator`（latent -> llm embedding）
+   - `stop_head`（结束判定）
+   - `spk_head`（声纹向量映射到 LLM hidden）
+4. 声纹提取：
+   - `SpkembExtractor(campplus.onnx)`（ONNXRuntime CPU 执行）
+5. 并发/图优化：
+   - `CFMGraphExecutorPool`（CUDA Graph 复用）
+   - `model_graph_pool`（Qwen2 forward 的 graph/cache 复用）
+6. 文本规范化与音色配置：
+   - `TalkerTN`、`voice_name.json`
+
+> `BailingTalkerConfig` 在仓库内是轻量壳（`pass`），实际字段由 `from_pretrained` 读取权重目录中的配置并在运行时使用（如 `flowmodel/steps/patch_size/history_patch_size/name_or_path`）。
+
+#### 6.2.2 执行路径（token -> wav）
+
+核心链路（以 `instruct_audio_generation` / `omni_audio_generation` 为例）：
+
+1. prompt 处理：
+   - `get_prompt_emb(...)`  
+   - 必要时 `register_prompt_wav(...)`：
+     - `audio_detokenizer.encode_latent(...)` 得 `prompt_wav_lat`
+     - `Aggregator` 得 `prompt_wav_emb`
+     - `SpkembExtractor + spk_head` 得 `spk_emb`
+2. 组装输入：
+   - `omni_audio_generation_func(...)` 拼接 system/user prompt、指令、`<audio>` 占位
+   - 将 `spk_emb` 和 `prompt_wav_emb` 注入 `inputs_embeds` 指定位置
+3. token 自回归生成：
+   - `generate(inputs_embeds, prompt_wav_lat, cfg, sigma, temperature)`
+   - 每步执行：
+     - `Qwen2Model` 前向（带 `StaticCache`）
+     - `CFM sample` 生成 latent token
+     - `Aggregator` 生成下一步输入 embedding
+     - `stop_head` 判停
+4. token 解码为波形：
+   - `tts_job -> token2wav(audio_detokenizer.decode(...))`
+   - 支持 `stream=True` 流式、`stream=False` 整句
+   - `silence_holder` 做静音裁剪/拼接
+
+#### 6.2.3 不同任务/模式差异
+
+| 维度 | 分支 | 差异 |
+|---|---|---|
+| 任务类型 | `taskname` | `TTA/BGM/STYLE/SPEECH_BGM/SPEECH_SOUND/PODCAST`：整体直接生成；`TTS/EMOTION/BASIC/DIALECT/IP`：按文本分句切片逐段生成 |
+| 说话人条件 | `use_spk_emb` | 使用参考音频提取声纹并注入 |
+| 零样本说话人 | `use_zero_spk_emb` | 无参考音频时注入零向量声纹 |
+| 声线模板 | `voice_name` | 命中 `voice_name.json` 时自动带入 `prompt_text + prompt_wav_path` |
+| 输出策略 | `stream` | 流式逐块返回音频；非流式一次返回整段 |
+| 采样风格 | `cfg/sigma/temperature/max_decode_steps` | 控制 token 生成风格、随机性和最大长度 |
+
+#### 6.2.4 与主 VLM 路径的关系
+
+- Talker 不走 `BailingMM2 -> BailingMoeV2` 的常规文本生成路径。
+- 它是独立的语音生成子系统（Qwen2 + CFM/DiT + VAE），通过 `load_talker=True` 挂载到主模型对象，便于统一分发与部署。
 
 ---
 
